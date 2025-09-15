@@ -25,22 +25,17 @@ struct StaticContextHolder {
   Derived* parent = nullptr;
   Derived* next = nullptr;
 
-  struct NoRegisterTag {};
-
  protected:
-  // Root constructor: name "/", self parent/next, no registration
-  explicit StaticContextHolder(NoRegisterTag) {
-    parent = static_cast<Derived*>(this);
-    next = static_cast<Derived*>(this);
-  }
-
   // Named constructor for regular holders: auto-register with singleton
   // registry
-  explicit StaticContextHolder() {
-    parent = nullptr;
-    next = nullptr;
-    StaticContextRegistry<Derived>::instance().register_holder(
-        *static_cast<Derived*>(this));
+  StaticContextHolder() {
+    parent = static_cast<Derived*>(this);
+    next = static_cast<Derived*>(this);
+
+    if (StaticContextRegistry<Derived>::has_instance()) {
+      StaticContextRegistry<Derived>::instance().register_holder(
+          *static_cast<Derived*>(this));
+    }
   }
 };
 
@@ -52,6 +47,8 @@ class StaticContextRegistry {
     static StaticContextRegistry registry;
     return registry;
   }
+
+  static bool has_instance() { return has_instance_flag(); }
 
   void register_holder(Holder& holder) {
     holder.next = root.next;
@@ -82,7 +79,14 @@ class StaticContextRegistry {
 
  protected:
   Holder root;
-  StaticContextRegistry() : root(typename Holder::NoRegisterTag{}) {}
+
+  StaticContextRegistry() { has_instance_flag() = true; }
+
+ private:
+  static bool& has_instance_flag() {
+    static bool flag = false;
+    return flag;
+  }
 };
 
 // Thread-local cursor for tracking call stack
@@ -139,7 +143,6 @@ struct StaticTimeHolder : public StaticContextHolder<StaticTimeHolder> {
   uint64_t total_time_ns = 0;
   uint32_t call_count = 0;
   using Base = StaticContextHolder<StaticTimeHolder>;
-  using NoRegisterTag = typename Base::NoRegisterTag;
 
   explicit StaticTimeHolder(const char* timer_name) {
     size_t len = std::min(strlen(timer_name), 63UL);
@@ -158,7 +161,7 @@ struct StaticTimeHolder : public StaticContextHolder<StaticTimeHolder> {
   char mname[64];
 
   // Root constructor used by registry
-  explicit StaticTimeHolder(NoRegisterTag) : Base(NoRegisterTag{}) {
+  StaticTimeHolder() {
     mname[0] = '/';
     mname[1] = '\0';
   }
