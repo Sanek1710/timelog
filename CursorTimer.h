@@ -14,7 +14,7 @@
 
 namespace cursor_timer {
 
-// Forward declarations
+// time registry
 class StaticTimeHolderRegistry;
 
 // High-resolution clock
@@ -22,28 +22,38 @@ using Clock = std::chrono::high_resolution_clock;
 using TimePoint = Clock::time_point;
 using Duration = std::chrono::nanoseconds;
 
-// Static time holder - exists for program lifetime
+// should always be static!!!
 struct StaticTimeHolder {
   char name[64];
-  uint64_t total_time_ns;
-  uint32_t call_count;
-  StaticTimeHolder* parent;  // Can be overwritten
-  StaticTimeHolder* next;    // Linked list pointer
+  uint64_t total_time_ns = 0;
+  uint32_t call_count = 0;
+  // parent holder - evaluated at runtime, can be
+  // overwritten if call-paths are merged
+  StaticTimeHolder* parent = nullptr;
+  // registry next holder
+  StaticTimeHolder* next = nullptr;
 
-  StaticTimeHolder(const char* timer_name)
-      : total_time_ns(0), call_count(0), parent(nullptr), next(nullptr) {
-    size_t len = std::min(strlen(timer_name), 63UL);
-    memcpy(name, timer_name, len);
-    name[len] = '\0';
-  }
+  // requires to be registered in StaticTimeHolderRegistry
+  StaticTimeHolder(const char* timer_name, StaticTimeHolderRegistry& registry);
 
   void add_timing(uint64_t duration_ns) {
     total_time_ns += duration_ns;
     call_count++;
   }
+
+ private:
+  // root time holder private constructor
+  // only accessible by registry
+  // is its own parent and its own next element
+  StaticTimeHolder()
+      : name("/"), total_time_ns(0), call_count(0), parent(this), next(this) {}
+
+  friend class StaticTimeHolderRegistry;
 };
 
-// Global static time holder registry
+// global static time holder registry
+// TODO: can be made template at some point to support multiple registries
+// defined by type tag or value tag
 class StaticTimeHolderRegistry {
  public:
   static StaticTimeHolderRegistry& instance() {
@@ -52,47 +62,41 @@ class StaticTimeHolderRegistry {
   }
 
   // Register a new static time holder (called by static instances)
-  bool register_holder(StaticTimeHolder* holder) {
+  void register_holder(StaticTimeHolder& holder) {
     // Add to circular linked list - insert after root
-    holder->next = root_.next;
-    root_.next = holder;
-    return true;
+    holder.next = root.next;
+    root.next = &holder;
   }
 
   // Iterator for the circular linked list
   class iterator {
    public:
-    iterator(StaticTimeHolder* ptr) : ptr_(ptr) {}
+    iterator(StaticTimeHolder* ptr) : ptr(ptr) {}
 
-    StaticTimeHolder* operator*() const { return ptr_; }
-    StaticTimeHolder* operator->() const { return ptr_; }
+    StaticTimeHolder* operator*() const { return ptr; }
+    StaticTimeHolder* operator->() const { return ptr; }
 
-    iterator& operator++() {
-      ptr_ = ptr_->next;
-      return *this;
-    }
+    iterator& operator++() { return ptr = ptr->next, *this; }
 
-    bool operator!=(const iterator& other) const { return ptr_ != other.ptr_; }
-    bool operator==(const iterator& other) const { return ptr_ == other.ptr_; }
+    bool operator!=(const iterator& other) const { return ptr != other.ptr; }
+    bool operator==(const iterator& other) const { return ptr == other.ptr; }
 
    private:
-    StaticTimeHolder* ptr_;
+    StaticTimeHolder* ptr;
   };
 
-  // Begin iterator (first element after root)
+  // element after root
   iterator begin() const {
-    return iterator(const_cast<StaticTimeHolder*>(root_.next));
+    return iterator(const_cast<StaticTimeHolder*>(root.next));
   }
-
-  // End iterator (root itself - circular list)
+  // always root node
   iterator end() const {
-    return iterator(const_cast<StaticTimeHolder*>(&root_));
+    return iterator(const_cast<StaticTimeHolder*>(&root));
   }
 
-  // Check if empty (only root exists)
+  // empty -> only root linked to itself
   bool empty() const { return begin() == end(); }
 
-  // Reset all timing data
   void reset_all() {
     for (auto it = begin(); it != end(); ++it) {
       (*it)->total_time_ns = 0;
@@ -100,36 +104,47 @@ class StaticTimeHolderRegistry {
     }
   }
 
-  // Get root node
-  StaticTimeHolder* get_root() { return &root_; }
+  StaticTimeHolder* get_root() { return &root; }
 
  private:
-  StaticTimeHolder root_{"$ROOT$"};  // Static root node - no heap allocation
+  // static root node
+  // uses private constructor to link to itself
+  StaticTimeHolder root;
 
-  // Initialize circular linked list
-  StaticTimeHolderRegistry() {
-    root_.next = &root_;  // Root points to itself initially
-  }
+  StaticTimeHolderRegistry() = default;
 };
+
+// StaticTimeHolder constructor definition (after StaticTimeHolderRegistry)
+inline StaticTimeHolder::StaticTimeHolder(const char* timer_name,
+                                          StaticTimeHolderRegistry& registry)
+    : total_time_ns(0), call_count(0), parent(nullptr), next(nullptr) {
+  size_t len = std::min(strlen(timer_name), 63UL);
+  memcpy(name, timer_name, len);
+  name[len] = '\0';
+
+  // Register self in the registry
+  registry.register_holder(*this);
+}
 
 // Thread-local cursor for tracking call stack
 class ThreadLocalCursor {
+  using Cursor = StaticTimeHolder*;
+
  private:
-  static StaticTimeHolder*& get_cursor_ref() {
-    thread_local StaticTimeHolder* cursor = nullptr;
+  static Cursor& get_cursor_ref() {
+    thread_local Cursor cursor =
+        StaticTimeHolderRegistry::instance().get_root();
     return cursor;
   }
 
  public:
-  static StaticTimeHolder* get_cursor() { return get_cursor_ref(); }
+  static Cursor get_cursor() { return get_cursor_ref(); }
 
-  static void set_cursor(StaticTimeHolder* holder) {
-    get_cursor_ref() = holder;
-  }
+  static void set_cursor(Cursor holder) { get_cursor_ref() = holder; }
 
-  static StaticTimeHolder* get_and_set_cursor(StaticTimeHolder* new_holder) {
-    StaticTimeHolder*& cursor_ref = get_cursor_ref();
-    StaticTimeHolder* old_cursor = cursor_ref;
+  static Cursor exchange(Cursor new_holder) {
+    Cursor& cursor_ref = get_cursor_ref();
+    Cursor old_cursor = cursor_ref;
     cursor_ref = new_holder;
     return old_cursor;
   }
@@ -139,44 +154,35 @@ class ThreadLocalCursor {
 class RuntimeTimer {
  public:
   RuntimeTimer(StaticTimeHolder* holder)
-      : holder_(holder), start_time_(Clock::now()) {
-    // Save current cursor as parent for this timer instance
-    parent_cursor_ = ThreadLocalCursor::get_cursor();
-
-    // Set parent relationship in static holder
-    if (parent_cursor_ != nullptr) {
-      holder_->parent = parent_cursor_;
-    }
-
-    // Move cursor to this holder
-    ThreadLocalCursor::set_cursor(holder_);
+      : holder(*holder),
+        parent_cursor(ThreadLocalCursor::exchange(holder)),
+        start_time(Clock::now()) {
+    // oh god i hope its never null by design
+    holder->parent = parent_cursor;
   }
 
   ~RuntimeTimer() {
     // Record timing
-    auto end_time = Clock::now();
-    auto duration =
-        std::chrono::duration_cast<Duration>(end_time - start_time_);
-    holder_->add_timing(duration.count());
+    const auto end_time = Clock::now();
+    const auto duration =
+        std::chrono::duration_cast<Duration>(end_time - start_time);
+    holder.add_timing(duration.count());
 
     // Restore cursor to the original parent
-    ThreadLocalCursor::set_cursor(parent_cursor_);
+    ThreadLocalCursor::set_cursor(parent_cursor);
   }
 
-  StaticTimeHolder* get_holder() const { return holder_; }
-
  private:
-  StaticTimeHolder* holder_;
-  StaticTimeHolder* parent_cursor_;  // Store original parent separately
-  TimePoint start_time_;
+  StaticTimeHolder& holder;
+  StaticTimeHolder* parent_cursor;  // Store original parent separately
+
+  TimePoint start_time;
 };
 
 // Convenience macros for easy usage
-#define STATIC_TIMER(name)                                                    \
-  static StaticTimeHolder _static_holder(name);                               \
-  static bool _dummy =                                                        \
-      (StaticTimeHolderRegistry::instance().register_holder(&_static_holder), \
-       true)
+#define STATIC_TIMER(name)                     \
+  static StaticTimeHolder _static_holder(name, \
+                                         StaticTimeHolderRegistry::instance())
 
 #define CURSOR_TIMER(name) \
   STATIC_TIMER(name);      \
@@ -199,9 +205,10 @@ class TreePrinter {
 
     for (auto it = registry.begin(); it != registry.end(); ++it) {
       auto* holder = *it;
+
       if (holder->call_count == 0) continue;  // Skip unused holders
 
-      if (holder->parent == nullptr) {
+      if (holder->parent == registry.get_root()) {
         roots.push_back(holder);
       } else {
         children[holder->parent].push_back(holder);
@@ -255,7 +262,7 @@ class TreePrinter {
 
           // Print time first (right-aligned)
           std::string time_str =
-              format_duration_single(holder->total_time_ns) + "s";
+              format_duration_single(holder->total_time_ns) + "s ";
           os << std::setw(time_width) << std::right << time_str;
 
           // Print calls and average
@@ -263,27 +270,21 @@ class TreePrinter {
             double avg_seconds = static_cast<double>(holder->total_time_ns) /
                                  holder->call_count / 1000000000.0;
             os << "[" << std::setw(calls_width) << std::right
-               << holder->call_count << "/1 = " << std::setw(avg_width)
-               << std::fixed << std::setprecision(6) << avg_seconds << "s]";
+               << holder->call_count << " : " << std::setw(avg_width)
+               << std::fixed << std::setprecision(6) << avg_seconds << "s] ";
           } else {
             os << "[" << std::setw(calls_width) << std::right << "0"
-               << "/1 = " << std::setw(avg_width) << "0.000000s]";
+               << " : " << std::setw(avg_width) << "0.000000s] ";
           }
 
           // Print indentation
-          for (int i = 0; i < depth; ++i) {
-            os << "  ";
-          }
+          for (int i = 0; i < depth; ++i) os << "  ";
 
           // Print name and tree structure
-          os << "├─ " << std::setw(name_width) << std::left << holder->name;
+          os << " " << std::setw(name_width) << std::left << holder->name;
 
           // Print parent for debugging
-          if (holder->parent != nullptr) {
-            os << " <- " << holder->parent->name;
-          } else {
-            os << " <- (root)";
-          }
+          // os << " <- " << holder->parent->name;
 
           os << "\n";
 
@@ -297,7 +298,7 @@ class TreePrinter {
         };
 
     // Print header
-    os << "\n=== Cursor Timer Tree ===\n";
+    os << "\nTIME REGISTRY:\n";
 
     // Print all root holders
     for (auto* root : roots) {

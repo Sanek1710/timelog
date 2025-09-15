@@ -121,26 +121,21 @@ void multi_threaded_example() {
   }
 }
 
+void shared_timer_func() {
+  CURSOR_TIMER("shared_timer");
+  volatile int x = 42;
+}
+
 void demonstrate_parent_overwriting() {
   CURSOR_TIMER("parent_overwriting_demo");
-
-  // This demonstrates how parent relationships can be overwritten
-  // when the same static timer is used in different call contexts
-
   {
     CURSOR_TIMER("context_a");
-    {
-      CURSOR_TIMER("shared_timer");
-      volatile int x = 42;
-    }
+    { shared_timer_func(); }
   }
 
   {
     CURSOR_TIMER("context_b");
-    {
-      CURSOR_TIMER("shared_timer");  // Same timer, different parent context
-      volatile int y = 84;
-    }
+    { shared_timer_func(); }
   }
 
   // The "shared_timer" will show up under "context_b" in the tree
@@ -179,7 +174,41 @@ void stress_test_cursor_system() {
                         end_time - start_time)
                         .count();
 
+  start_time = std::chrono::high_resolution_clock::now();
+  for (int iter = 0; iter < ITERATIONS; ++iter) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < CALLS_PER_ITERATION; ++i) {
+      auto start_time = std::chrono::high_resolution_clock::now();
+
+      // Minimal work
+      volatile int x = i * iter;
+      auto end_time = std::chrono::high_resolution_clock::now();
+      volatile auto dummy =
+          std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+                                                                start_time)
+              .count();
+    }
+
+    // Progress indicator
+    if (iter % 10000 == 0) {
+      std::cout << "Completed " << iter << " iterations...\n";
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    volatile auto dummy = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              end_time - start_time)
+                              .count();
+  }
+  end_time = std::chrono::high_resolution_clock::now();
+  auto total_raw_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            end_time - start_time)
+                            .count();
+
+  double relaive_overhead =
+      double(total_time - total_raw_time) / total_raw_time;
   std::cout << "Stress test completed in " << total_time << "ms\n";
+  std::cout << "Raw timer runs in " << total_raw_time << "ms\n";
+  std::cout << "Average relative overhead: " << relaive_overhead << "ms\n";
 }
 
 int main() {
