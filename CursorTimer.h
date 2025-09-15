@@ -14,121 +14,114 @@
 
 namespace cursor_timer {
 
-// time registry
-class StaticTimeHolderRegistry;
+// generic context registry forward declaration
+template <typename Holder>
+class StaticContextRegistry;
 
-// High-resolution clock
-using Clock = std::chrono::high_resolution_clock;
-using TimePoint = Clock::time_point;
-using Duration = std::chrono::nanoseconds;
-
-// should always be static!!!
-struct StaticTimeHolder {
+// Base static context holder (independent of time logic)
+struct StaticContextHolder {
   char name[64];
+  StaticContextHolder* parent = nullptr;
+  StaticContextHolder* next = nullptr;
+
+ protected:
+  // Root constructor: name "/", self parent/next
+  StaticContextHolder() : parent(this), next(this) {
+    name[0] = '/';
+    name[1] = '\0';
+  }
+
+  explicit StaticContextHolder(const char* n) : parent(nullptr), next(nullptr) {
+    size_t len = std::min(strlen(n), 63UL);
+    memcpy(name, n, len);
+    name[len] = '\0';
+  }
+};
+
+// Generic global static context registry (circular list)
+template <typename Holder>
+class StaticContextRegistry {
+ public:
+  static StaticContextRegistry& instance() {
+    static StaticContextRegistry registry;
+    return registry;
+  }
+
+  void register_holder(Holder& holder) {
+    holder.next = root.next;
+    root.next = &holder;
+  }
+
+  class iterator {
+   public:
+    explicit iterator(Holder* ptr) : ptr(ptr) {}
+    Holder* operator*() const { return ptr; }
+    Holder* operator->() const { return ptr; }
+    iterator& operator++() { return ptr = static_cast<Holder*>(ptr->next), *this; }
+    bool operator!=(const iterator& other) const { return ptr != other.ptr; }
+    bool operator==(const iterator& other) const { return ptr == other.ptr; }
+
+   private:
+    Holder* ptr;
+  };
+
+  iterator begin() const {
+    return iterator(const_cast<Holder*>(static_cast<const Holder*>(root.next)));
+  }
+  iterator end() const { return iterator(const_cast<Holder*>(&root)); }
+
+  bool empty() const { return begin() == end(); }
+
+  Holder* get_root() { return &root; }
+
+ protected:
+  Holder root;  // uses Holder's default root ctor
+  StaticContextRegistry() = default;
+};
+
+
+
+
+// Forward declare time holder and define alias registry
+struct StaticTimeHolder;
+using StaticTimeHolderRegistry = StaticContextRegistry<StaticTimeHolder>;
+
+// Time holder derives from context holder
+struct StaticTimeHolder : public StaticContextHolder {
   uint64_t total_time_ns = 0;
   uint32_t call_count = 0;
-  // parent holder - evaluated at runtime, can be
-  // overwritten if call-paths are merged
-  StaticTimeHolder* parent = nullptr;
-  // registry next holder
-  StaticTimeHolder* next = nullptr;
 
-  // requires to be registered in StaticTimeHolderRegistry
-  StaticTimeHolder(const char* timer_name, StaticTimeHolderRegistry& registry);
+  StaticTimeHolder(const char* timer_name, StaticTimeHolderRegistry& registry)
+      : StaticContextHolder(timer_name) {
+    registry.register_holder(*this);
+  }
 
   void add_timing(uint64_t duration_ns) {
     total_time_ns += duration_ns;
     call_count++;
   }
 
- private:
-  // root time holder private constructor
-  // only accessible by registry
-  // is its own parent and its own next element
-  StaticTimeHolder()
-      : name("/"), total_time_ns(0), call_count(0), parent(this), next(this) {}
+ protected:
+  // Root constructor used by registry
+  StaticTimeHolder() = default;
 
-  friend class StaticTimeHolderRegistry;
+  template <typename Holder>
+  friend class StaticContextRegistry;
 };
 
-// global static time holder registry
-// TODO: can be made template at some point to support multiple registries
-// defined by type tag or value tag
-class StaticTimeHolderRegistry {
- public:
-  static StaticTimeHolderRegistry& instance() {
-    static StaticTimeHolderRegistry registry;
-    return registry;
+// Reset all timing data
+inline void reset_all_timeholders() {
+  auto& reg = StaticTimeHolderRegistry::instance();
+  for (auto it = reg.begin(); it != reg.end(); ++it) {
+    (*it)->total_time_ns = 0;
+    (*it)->call_count = 0;
   }
-
-  // Register a new static time holder (called by static instances)
-  void register_holder(StaticTimeHolder& holder) {
-    // Add to circular linked list - insert after root
-    holder.next = root.next;
-    root.next = &holder;
-  }
-
-  // Iterator for the circular linked list
-  class iterator {
-   public:
-    iterator(StaticTimeHolder* ptr) : ptr(ptr) {}
-
-    StaticTimeHolder* operator*() const { return ptr; }
-    StaticTimeHolder* operator->() const { return ptr; }
-
-    iterator& operator++() { return ptr = ptr->next, *this; }
-
-    bool operator!=(const iterator& other) const { return ptr != other.ptr; }
-    bool operator==(const iterator& other) const { return ptr == other.ptr; }
-
-   private:
-    StaticTimeHolder* ptr;
-  };
-
-  // element after root
-  iterator begin() const {
-    return iterator(const_cast<StaticTimeHolder*>(root.next));
-  }
-  // always root node
-  iterator end() const {
-    return iterator(const_cast<StaticTimeHolder*>(&root));
-  }
-
-  // empty -> only root linked to itself
-  bool empty() const { return begin() == end(); }
-
-  void reset_all() {
-    for (auto it = begin(); it != end(); ++it) {
-      (*it)->total_time_ns = 0;
-      (*it)->call_count = 0;
-    }
-  }
-
-  StaticTimeHolder* get_root() { return &root; }
-
- private:
-  // static root node
-  // uses private constructor to link to itself
-  StaticTimeHolder root;
-
-  StaticTimeHolderRegistry() = default;
-};
-
-// StaticTimeHolder constructor definition (after StaticTimeHolderRegistry)
-inline StaticTimeHolder::StaticTimeHolder(const char* timer_name,
-                                          StaticTimeHolderRegistry& registry)
-    : total_time_ns(0), call_count(0), parent(nullptr), next(nullptr) {
-  size_t len = std::min(strlen(timer_name), 63UL);
-  memcpy(name, timer_name, len);
-  name[len] = '\0';
-
-  // Register self in the registry
-  registry.register_holder(*this);
 }
 
 // Thread-local cursor for tracking call stack
-class ThreadLocalCursor {
-  using Cursor = StaticTimeHolder*;
+template <typename Holder, typename Registry>
+class ThreadLocalContextCursor {
+  using Cursor = Holder*;
 
  private:
   static Cursor& get_cursor_ref() {
@@ -150,12 +143,19 @@ class ThreadLocalCursor {
   }
 };
 
+using ThreadLocalTimeCursor = ThreadLocalContextCursor<StaticTimeHolder, StaticTimeHolderRegistry>;
+
+// High-resolution clock
+using Clock = std::chrono::high_resolution_clock;
+using TimePoint = Clock::time_point;
+using Duration = std::chrono::nanoseconds;
+
 // Runtime timer - lightweight RAII object
 class RuntimeTimer {
  public:
   RuntimeTimer(StaticTimeHolder* holder)
       : holder(*holder),
-        parent_cursor(ThreadLocalCursor::exchange(holder)),
+        parent_cursor(ThreadLocalTimeCursor::exchange(holder)),
         start_time(Clock::now()) {
     // oh god i hope its never null by design
     holder->parent = parent_cursor;
@@ -169,7 +169,7 @@ class RuntimeTimer {
     holder.add_timing(duration.count());
 
     // Restore cursor to the original parent
-    ThreadLocalCursor::set_cursor(parent_cursor);
+    ThreadLocalTimeCursor::set_cursor(parent_cursor);
   }
 
  private:
@@ -211,7 +211,7 @@ class TreePrinter {
       if (holder->parent == registry.get_root()) {
         roots.push_back(holder);
       } else {
-        children[holder->parent].push_back(holder);
+        children[static_cast<StaticTimeHolder*>(holder->parent)].push_back(holder);
       }
     }
 
@@ -329,7 +329,7 @@ class TreePrinter {
        << std::setprecision(6) << avg_seconds << "s\n";
   }
 
-  static void reset_all() { StaticTimeHolderRegistry::instance().reset_all(); }
+  static void reset_all() { reset_all_timeholders(); }
 };
 
 }  // namespace cursor_timer
