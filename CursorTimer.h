@@ -18,23 +18,29 @@ namespace cursor_timer {
 template <typename Holder>
 class StaticContextRegistry;
 
-// Base static context holder (independent of time logic)
+// Base static context holder (independent of time logic) with CRTP
+// auto-registration
+template <typename Derived>
 struct StaticContextHolder {
-  char name[64];
-  StaticContextHolder* parent = nullptr;
-  StaticContextHolder* next = nullptr;
+  Derived* parent = nullptr;
+  Derived* next = nullptr;
+
+  struct NoRegisterTag {};
 
  protected:
-  // Root constructor: name "/", self parent/next
-  StaticContextHolder() : parent(this), next(this) {
-    name[0] = '/';
-    name[1] = '\0';
+  // Root constructor: name "/", self parent/next, no registration
+  explicit StaticContextHolder(NoRegisterTag) {
+    parent = static_cast<Derived*>(this);
+    next = static_cast<Derived*>(this);
   }
 
-  explicit StaticContextHolder(const char* n) : parent(nullptr), next(nullptr) {
-    size_t len = std::min(strlen(n), 63UL);
-    memcpy(name, n, len);
-    name[len] = '\0';
+  // Named constructor for regular holders: auto-register with singleton
+  // registry
+  explicit StaticContextHolder() {
+    parent = nullptr;
+    next = nullptr;
+    StaticContextRegistry<Derived>::instance().register_holder(
+        *static_cast<Derived*>(this));
   }
 };
 
@@ -57,7 +63,9 @@ class StaticContextRegistry {
     explicit iterator(Holder* ptr) : ptr(ptr) {}
     Holder* operator*() const { return ptr; }
     Holder* operator->() const { return ptr; }
-    iterator& operator++() { return ptr = static_cast<Holder*>(ptr->next), *this; }
+    iterator& operator++() {
+      return ptr = static_cast<Holder*>(ptr->next), *this;
+    }
     bool operator!=(const iterator& other) const { return ptr != other.ptr; }
     bool operator==(const iterator& other) const { return ptr == other.ptr; }
 
@@ -65,9 +73,7 @@ class StaticContextRegistry {
     Holder* ptr;
   };
 
-  iterator begin() const {
-    return iterator(const_cast<Holder*>(static_cast<const Holder*>(root.next)));
-  }
+  iterator begin() const { return iterator(const_cast<Holder*>(root.next)); }
   iterator end() const { return iterator(const_cast<Holder*>(&root)); }
 
   bool empty() const { return begin() == end(); }
@@ -75,58 +81,19 @@ class StaticContextRegistry {
   Holder* get_root() { return &root; }
 
  protected:
-  Holder root;  // uses Holder's default root ctor
-  StaticContextRegistry() = default;
+  Holder root;
+  StaticContextRegistry() : root(typename Holder::NoRegisterTag{}) {}
 };
-
-
-
-
-// Forward declare time holder and define alias registry
-struct StaticTimeHolder;
-using StaticTimeHolderRegistry = StaticContextRegistry<StaticTimeHolder>;
-
-// Time holder derives from context holder
-struct StaticTimeHolder : public StaticContextHolder {
-  uint64_t total_time_ns = 0;
-  uint32_t call_count = 0;
-
-  StaticTimeHolder(const char* timer_name, StaticTimeHolderRegistry& registry)
-      : StaticContextHolder(timer_name) {
-    registry.register_holder(*this);
-  }
-
-  void add_timing(uint64_t duration_ns) {
-    total_time_ns += duration_ns;
-    call_count++;
-  }
-
- protected:
-  // Root constructor used by registry
-  StaticTimeHolder() = default;
-
-  template <typename Holder>
-  friend class StaticContextRegistry;
-};
-
-// Reset all timing data
-inline void reset_all_timeholders() {
-  auto& reg = StaticTimeHolderRegistry::instance();
-  for (auto it = reg.begin(); it != reg.end(); ++it) {
-    (*it)->total_time_ns = 0;
-    (*it)->call_count = 0;
-  }
-}
 
 // Thread-local cursor for tracking call stack
-template <typename Holder, typename Registry>
+template <typename Holder>
 class ThreadLocalContextCursor {
   using Cursor = Holder*;
 
  private:
   static Cursor& get_cursor_ref() {
     thread_local Cursor cursor =
-        StaticTimeHolderRegistry::instance().get_root();
+        StaticContextRegistry<Holder>::instance().get_root();
     return cursor;
   }
 
@@ -143,50 +110,104 @@ class ThreadLocalContextCursor {
   }
 };
 
-using ThreadLocalTimeCursor = ThreadLocalContextCursor<StaticTimeHolder, StaticTimeHolderRegistry>;
+// Generic runtime context that hides cursor/parent logic
+template <typename ContextHolder>
+class RuntimeContext {
+ public:
+  explicit RuntimeContext(ContextHolder* h)
+      : mholder(*h),
+        parent_cursor(ThreadLocalContextCursor<ContextHolder>::exchange(h)) {
+    // establish parent link for this run; allowed to be overwritten later
+    h->parent = parent_cursor;
+  }
+
+  ~RuntimeContext() {
+    ThreadLocalContextCursor<ContextHolder>::set_cursor(parent_cursor);
+  }
+
+  ContextHolder& context() { return mholder; }
+
+ protected:
+  ContextHolder& mholder;
+  ContextHolder* parent_cursor;
+};
+
+// TIME CONTEXT
+
+// Time holder derives from context holder
+struct StaticTimeHolder : public StaticContextHolder<StaticTimeHolder> {
+  uint64_t total_time_ns = 0;
+  uint32_t call_count = 0;
+  using Base = StaticContextHolder<StaticTimeHolder>;
+  using NoRegisterTag = typename Base::NoRegisterTag;
+
+  explicit StaticTimeHolder(const char* timer_name) {
+    size_t len = std::min(strlen(timer_name), 63UL);
+    memcpy(mname, timer_name, len);
+    mname[len] = '\0';
+  }
+
+  void add_timing(uint64_t duration_ns) {
+    total_time_ns += duration_ns;
+    call_count++;
+  }
+
+  std::string name() const { return mname; }
+
+ protected:
+  char mname[64];
+
+  // Root constructor used by registry
+  explicit StaticTimeHolder(NoRegisterTag) : Base(NoRegisterTag{}) {
+    mname[0] = '/';
+    mname[1] = '\0';
+  }
+
+  template <typename Holder>
+  friend class StaticContextRegistry;
+};
+
+// Public alias using the requested naming
+using StaticTimeHolderRegistry = StaticContextRegistry<StaticTimeHolder>;
+
+// Reset all timing data
+inline void reset_all_timeholders() {
+  auto& reg = StaticTimeHolderRegistry::instance();
+  for (auto it = reg.begin(); it != reg.end(); ++it) {
+    (*it)->total_time_ns = 0;
+    (*it)->call_count = 0;
+  }
+}
 
 // High-resolution clock
 using Clock = std::chrono::high_resolution_clock;
 using TimePoint = Clock::time_point;
 using Duration = std::chrono::nanoseconds;
 
-// Runtime timer - lightweight RAII object
-class RuntimeTimer {
+// Time RAII built on RuntimeContext
+class RuntimeTimeContext : private RuntimeContext<StaticTimeHolder> {
  public:
-  RuntimeTimer(StaticTimeHolder* holder)
-      : holder(*holder),
-        parent_cursor(ThreadLocalTimeCursor::exchange(holder)),
-        start_time(Clock::now()) {
-    // oh god i hope its never null by design
-    holder->parent = parent_cursor;
-  }
+  explicit RuntimeTimeContext(StaticTimeHolder* h)
+      : RuntimeContext<StaticTimeHolder>(h), start_time(Clock::now()) {}
 
-  ~RuntimeTimer() {
+  ~RuntimeTimeContext() {
     // Record timing
     const auto end_time = Clock::now();
     const auto duration =
         std::chrono::duration_cast<Duration>(end_time - start_time);
-    holder.add_timing(duration.count());
-
-    // Restore cursor to the original parent
-    ThreadLocalTimeCursor::set_cursor(parent_cursor);
+    context().add_timing(duration.count());
   }
 
  private:
-  StaticTimeHolder& holder;
-  StaticTimeHolder* parent_cursor;  // Store original parent separately
-
   TimePoint start_time;
 };
 
 // Convenience macros for easy usage
-#define STATIC_TIMER(name)                     \
-  static StaticTimeHolder _static_holder(name, \
-                                         StaticTimeHolderRegistry::instance())
+#define STATIC_TIMER(name) static StaticTimeHolder _static_holder(name)
 
 #define CURSOR_TIMER(name) \
   STATIC_TIMER(name);      \
-  RuntimeTimer _runtime_timer(&_static_holder)
+  RuntimeTimeContext _runtime_timer(&_static_holder)
 
 // Tree printing utilities
 class TreePrinter {
@@ -211,7 +232,8 @@ class TreePrinter {
       if (holder->parent == registry.get_root()) {
         roots.push_back(holder);
       } else {
-        children[static_cast<StaticTimeHolder*>(holder->parent)].push_back(holder);
+        children[static_cast<StaticTimeHolder*>(holder->parent)].push_back(
+            holder);
       }
     }
 
@@ -281,7 +303,7 @@ class TreePrinter {
           for (int i = 0; i < depth; ++i) os << "  ";
 
           // Print name and tree structure
-          os << " " << std::setw(name_width) << std::left << holder->name;
+          os << " " << std::setw(name_width) << std::left << holder->name();
 
           // Print parent for debugging
           // os << " <- " << holder->parent->name;
