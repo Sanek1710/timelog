@@ -183,7 +183,41 @@ inline void reset_all_timeholders() {
 }
 
 // High-resolution clock
-using Clock = std::chrono::high_resolution_clock;
+
+struct Clock {
+  using base_clock = std::chrono::high_resolution_clock;
+  using time_point = base_clock::time_point;
+
+  static auto now() { return instance().get_time(); }
+
+ private:
+  bool runnin = true;
+  time_point almost_now = base_clock::now();
+  std::thread time_updater;
+
+  Clock()
+      : almost_now(base_clock::now()),
+        time_updater(std::thread([this]() { update_time(); })) {}
+
+  ~Clock() {
+    runnin = false;
+    time_updater.join();
+  }
+
+  time_point get_time() const { return almost_now; }
+  void update_time() {
+    while (runnin) almost_now = base_clock::now();
+  }
+
+  static Clock& instance() {
+    static Clock clock;
+    return clock;
+  }
+
+ private:
+};
+
+// using Clock = std::chrono::high_resolution_clock;
 using TimePoint = Clock::time_point;
 using Duration = std::chrono::nanoseconds;
 

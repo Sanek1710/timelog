@@ -176,14 +176,14 @@ void stress_test_cursor_system() {
 
   start_time = std::chrono::high_resolution_clock::now();
   for (int iter = 0; iter < ITERATIONS; ++iter) {
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time = Clock::now();
 
     for (int i = 0; i < CALLS_PER_ITERATION; ++i) {
-      auto start_time = std::chrono::high_resolution_clock::now();
+      auto start_time = Clock::now();
 
       // Minimal work
       volatile int x = i * iter;
-      auto end_time = std::chrono::high_resolution_clock::now();
+      auto end_time = Clock::now();
       volatile auto dummy =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
                                                                 start_time)
@@ -194,7 +194,7 @@ void stress_test_cursor_system() {
     if (iter % 10000 == 0) {
       std::cout << "Completed " << iter << " iterations...\n";
     }
-    auto end_time = std::chrono::high_resolution_clock::now();
+    auto end_time = Clock::now();
     volatile auto dummy = std::chrono::duration_cast<std::chrono::milliseconds>(
                               end_time - start_time)
                               .count();
@@ -239,7 +239,7 @@ int main() {
 
   // Test 6: Stress test (uncomment for heavy testing)
   // std::cout << "\nTest 6: Stress test\n";
-  // stress_test_cursor_system();
+  stress_test_cursor_system();
 
   // Print results
   std::cout << "\n=== Performance Results ===\n";
